@@ -1,3 +1,8 @@
+Important Note
+==================
+
+This POC was nice for it's time. However tools like Cursor and Windsurf are now applying this principle embedded in the IDE.
+
 Project Motivation
 ==================
 
