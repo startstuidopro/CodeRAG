@@ -1,8 +1,8 @@
 from openai import OpenAI
-from coderag.config import OPENAI_API_KEY, OPENAI_CHAT_MODEL
+from coderag.config import OPENAI_API_KEY, OPENAI_CHAT_MODEL,CHAT_BASE_URL
 from coderag.search import search_code
 
-client = OpenAI(api_key=OPENAI_API_KEY)
+client = OpenAI(api_key=OPENAI_API_KEY,base_url=CHAT_BASE_URL)
 
 SYSTEM_PROMPT = """
 You are an expert coding assistant. Your task is to help users with their question. Use the retrieved code context to inform your responses, but feel free to suggest better solutions if appropriate.

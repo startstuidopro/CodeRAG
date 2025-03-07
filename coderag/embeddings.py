@@ -1,9 +1,9 @@
 from openai import OpenAI
 import numpy as np
-from coderag.config import OPENAI_API_KEY, OPENAI_EMBEDDING_MODEL
+from coderag.config import OPENAI_API_KEY, OPENAI_EMBEDDING_MODEL, EMBEDDING_BASE_URL
 
 # Initialize the OpenAI client
-client = OpenAI(api_key=OPENAI_API_KEY)
+client = OpenAI(api_key=OPENAI_API_KEY,base_url=EMBEDDING_BASE_URL)
 
 def generate_embeddings(text):
     """Generate embeddings using the updated OpenAI API."""

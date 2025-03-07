@@ -9,6 +9,8 @@ load_dotenv()
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 OPENAI_EMBEDDING_MODEL = os.getenv("OPENAI_EMBEDDING_MODEL", "text-embedding-ada-002")  # Default to ada-002
 OPENAI_CHAT_MODEL = os.getenv("OPENAI_CHAT_MODEL", "gpt-4")  # Default to GPT-4
+CHAT_BASE_URL = os.getenv("CHAT_BASE_URL", "https://api.openai.com/v1/engines/gpt-4/completions")
+EMBEDDING_BASE_URL = os.getenv("EMBEDDING_BASE_URL", "https://api.openai.com/v1/engines/text-embedding-ada-002/completions")
 
 # Embedding dimension (from .env or fallback)
 EMBEDDING_DIM = int(os.getenv("EMBEDDING_DIM", 1536))  # Default to 1536 if not in .env
