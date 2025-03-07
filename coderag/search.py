@@ -2,7 +2,7 @@ import numpy as np
 from coderag.index import load_index, get_metadata
 from coderag.embeddings import generate_embeddings
 
-def search_code(query, k=5):
+def search_code(query, k=30):
     """Search the FAISS index using a text query."""
     index = load_index()  # Load the FAISS index
     query_embedding = generate_embeddings(query)  # Generate embedding for the query
@@ -26,4 +26,7 @@ def search_code(query, k=5):
             })
         else:
             print(f"Warning: Index {idx} is out of bounds for metadata with length {len(get_metadata())}")
+    print(f"Search results for query '{query}':")
+    for result in results:
+        print(f" - {result['filename']} (Distance: {result['distance']}) - {result['filepath']}")
     return results

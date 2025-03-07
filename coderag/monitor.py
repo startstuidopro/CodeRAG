@@ -18,7 +18,7 @@ class CodeChangeHandler(FileSystemEventHandler):
         if event.is_directory or should_ignore_path(event.src_path):
             return
 
-        if event.src_path.endswith(".py"):
+        if event.src_path.endswith(".ts") or event.src_path.endswith(".js") or event.src_path.endswith(".json") or event.src_path.endswith(".md") or event.src_path.endswith(".tsx"):
             print(f"Detected change in file: {event.src_path}")
             with open(event.src_path, 'r', encoding='utf-8') as f:
                 full_content = f.read()
