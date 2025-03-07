@@ -30,7 +30,7 @@ def execute_rag_flow(user_query):
         # Prepare code context
         code_context = "\n\n".join([
             f"File: {result['filename']}\n{result['content']}"
-            for result in search_results[:3]  # Limit to top 3 results
+            for result in search_results[:10]  # Limit to top 3 results
         ])
         
         # Construct the full prompt
