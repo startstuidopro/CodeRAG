@@ -28,7 +28,7 @@ def full_reindex():
                 logging.info(f"Ignoring file: {filepath}")
                 continue
 
-            if file.endswith(".py"):
+            if file.endswith(".ts") or file.endswith(".js") or file.endswith(".json") or file.endswith(".md") or file.endswith(".tsx"):
                 logging.info(f"Processing file: {filepath}")
                 try:
                     with open(filepath, 'r', encoding='utf-8') as f:
