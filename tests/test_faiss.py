@@ -1,5 +1,12 @@
 import faiss
-from coderag.index import load_index, retrieve_vectors, inspect_metadata, add_to_index, save_index, clear_index
+from coderag.core.vector_retriever import (
+    load_index,
+    retrieve_vectors,
+    inspect_metadata,
+    add_to_index,
+    save_index,
+    clear_index
+)
 from coderag.embeddings import generate_embeddings
 import os
 

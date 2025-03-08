@@ -49,10 +49,29 @@ Question: {question}</s>
         
         return self.tokenizer.decode(outputs[0], skip_special_tokens=True)
 
-    def validate_response(self, response: str) -> bool:
-        """Check for valid response structure and source citations"""
-        return any([
-            "cannot be deduced" in response,
-            "source document" in response,
-            len(response.strip()) > 10
-        ])
+    def validate_response(self, response: str) -> dict:
+        """Check response validity with detailed diagnostics"""
+        validation = {
+            "has_source": re.search(r"\[source:\d+\]", response) is not None,
+            "has_disclaimer": "cannot be deduced" in response.lower(),
+            "valid_length": 10 < len(response.strip()) < 1000,
+            "proper_format": not re.search(r"```|\*\*", response),
+            "complete_sentence": bool(re.search(r"[.!?]$", response.strip()))
+        }
+        return {
+            "valid": all(validation.values()),
+            "details": validation
+        }
+
+    def sanitize_response(self, response: str) -> str:
+        """Clean and format response output"""
+        cleaned = re.sub(r"<\|.*?\|>", "", response)  # Remove special tokens
+        cleaned = re.sub(r"\s+", " ", cleaned).strip()
+        return re.sub(r"[^.!?]+$", "", cleaned)  # Trim incomplete sentences
+
+    def validate_input(self, question: str, context: str):
+        """Validate inputs before processing"""
+        if not question.strip() or len(question) < 3:
+            raise ValueError("Question must be at least 3 characters")
+        if not context.strip():
+            raise ValueError("Context cannot be empty")

@@ -1,9 +1,9 @@
 from langchain_community.vectorstores import FAISS
-from langchain_huggingface import HuggingFaceEmbeddings
+from langchain_community.embeddings import HuggingFaceEmbeddings
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain.schema import Document
 from typing import List, Optional
-from .caching import CacheManager
+
 from .reranker import ColbertReranker
 import hashlib
 import json
@@ -15,6 +15,9 @@ class VectorRetriever:
                  reranker_model="colbert-ir/colbertv2.0",
                  redis_host="localhost",
                  redis_port=6379):
+        # Version tracking system
+        self.index_version = 1
+        self.document_versions = {}  # Track source -> version mapping
         
         # Embedding model and vector store
         self.embedding_model = HuggingFaceEmbeddings(
@@ -48,9 +51,14 @@ class VectorRetriever:
         return (base_hash, document.metadata.get('version', 1))
 
     def load_documents(self, documents: List[Document], incremental: bool = False):
-        """Process and index documents with caching and incremental updates"""
+        """Process and index documents with version tracking and incremental updates"""
         processed_docs = []
+        
+        # Update document versions
         for doc in documents:
+            source = doc.metadata.get("source", "unknown")
+            self.document_versions[source] = self.document_versions.get(source, 0) + 1
+            
             doc_hash = self._get_doc_hash(doc)
             cached_emb = self.cache.get_cached_embeddings(doc_hash)
             
@@ -103,6 +111,31 @@ class VectorRetriever:
                 self.embedding_model,
                 distance_strategy="COSINE"
             )
+            self.index_version += 1  # Increment version on full rebuild
+
+    def save_snapshot(self, snapshot_name: str = None):
+        """Save versioned snapshot of the index with metadata"""
+        if not self.vector_store:
+            raise ValueError("No vector store initialized")
+            
+        snapshot_name = snapshot_name or f"v{self.index_version}"
+        path = f"faiss_snapshots/{snapshot_name}"
+        
+        # Save FAISS index
+        self.vector_store.save_local(path)
+        
+        # Save version metadata
+        metadata = {
+            "version": self.index_version,
+            "timestamp": datetime.now().isoformat(),
+            "document_versions": self.document_versions,
+            "document_count": self.vector_store.index.ntotal
+        }
+        
+        with open(f"{path}/metadata.json", "w") as f:
+            json.dump(metadata, f)
+            
+        return path
 
     def retrieve(self, query: str, top_k: int = 5, use_reranking: bool = True) -> List[Document]:
         """Retrieve with caching and optional reranking"""
