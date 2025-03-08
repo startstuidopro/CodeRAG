@@ -1,0 +1,540 @@
+   "source": [
+    "This notebook demonstrates how you can build an advanced RAG (Retrieval Augmented Generation) for answering a user's question about a specific knowledge base (here, the HuggingFace documentation), using LangChain.\n",
+    "\n",
+    "For an introduction to RAG, you can check [this other cookbook](rag_zephyr_langchain)!\n",
+    "\n",
+    "RAG systems are complex, with many moving parts: here is a RAG diagram, where we noted in blue all possibilities for system enhancement:\n",
+    "\n",
+    "<img src=\"https://huggingface.co/datasets/huggingface/cookbook-images/resolve/main/RAG_workflow.png\" height=\"700\">\n",
+    "\n",
+    "> 💡 As you can see, there are many steps to tune in this architecture: tuning the system properly will yield significant performance gains.\n",
+    "\n",
+    "In this notebook, we will take a look into many of these blue notes to see how to tune your RAG system and get the best performance.\n",
+    "\n",
+    "__Let's dig into the model building!__ First, we install the required model dependencies."
+   ]
+
+   "source": [
+    "!pip install -q torch transformers accelerate bitsandbytes langchain sentence-transformers faiss-cpu openpyxl pacmap datasets langchain-community ragatouille"
+   ] 
+
+   "source": [
+    "from tqdm.notebook import tqdm\n",
+    "import pandas as pd\n",
+    "from typing import Optional, List, Tuple\n",
+    "from datasets import Dataset\n",
+    "import matplotlib.pyplot as plt\n",
+    "\n",
+    "pd.set_option(\n",
+    "    \"display.max_colwidth\", None\n",
+    ")  # This will be helpful when visualizing retriever outputs"
+   ] 
+
+   "source": [
+    "### Load your knowledge base"
+   ]
+  
+   "source": [
+    "import datasets\n",
+    "\n",
+    "ds = datasets.load_dataset(\"m-ric/huggingface_doc\", split=\"train\")"
+   ]
+
+   "source": [
+    "from langchain.docstore.document import Document as LangchainDocument\n",
+    "\n",
+    "RAW_KNOWLEDGE_BASE = [\n",
+    "    LangchainDocument(page_content=doc[\"text\"], metadata={\"source\": doc[\"source\"]})\n",
+    "    for doc in tqdm(ds)\n",
+    "]"
+   ]
+ 
+   "source": [
+    "# 1. Retriever - embeddings 🗂️\n",
+    "The __retriever acts like an internal search engine__: given the user query, it returns a few relevant snippets from your knowledge base.\n",
+    "\n",
+    "These snippets will then be fed to the Reader Model to help it generate its answer.\n",
+    "\n",
+    "So __our objective here is, given a user question, to find the most relevant snippets from our knowledge base to answer that question.__\n",
+    "\n",
+    "This is a wide objective, it leaves open some questions. How many snippets should we retrieve? This parameter will be named `top_k`.\n",
+    "\n",
+    "How long should these snippets be? This is called the `chunk size`. There's no one-size-fits-all answers, but here are a few elements:\n",
+    "- 🔀 Your `chunk size` is allowed to vary from one snippet to the other.\n",
+    "- Since there will always be some noise in your retrieval, increasing the `top_k` increases the chance to get relevant elements in your retrieved snippets. 🎯 Shooting more arrows increases your probability of hitting your target.\n",
+    "- Meanwhile, the summed length of your retrieved documents should not be too high: for instance, for most current models 16k tokens will probably drown your Reader model in information due to [Lost-in-the-middle phenomenon](https://huggingface.co/papers/2307.03172). 🎯 Give your reader model only the most relevant insights, not a huge pile of books!\n",
+    "\n",
+    "\n",
+    "> In this notebook, we use Langchain library since __it offers a huge variety of options for vector databases and allows us to keep document metadata throughout the processing__."
+   ]
+ 
+   "source": [
+    "### 1.1 Split the documents into chunks\n",
+    "\n",
+    "- In this part, __we split the documents from our knowledge base into smaller chunks__ which will be the snippets on which the reader LLM will base its answer.\n",
+    "- The goal is to prepare a collection of **semantically relevant snippets**. So their size should be adapted to precise ideas: too small will truncate ideas, and too large will dilute them.\n",
+    "\n",
+    "💡 _Many options exist for text splitting: splitting on words, on sentence boundaries, recursive chunking that processes documents in a tree-like way to preserve structure information... To learn more about chunking, I recommend you read [this great notebook](https://github.com/FullStackRetrieval-com/RetrievalTutorials/blob/main/tutorials/LevelsOfTextSplitting/5_Levels_Of_Text_Splitting.ipynb) by Greg Kamradt._\n",
+    "\n",
+    "\n",
+    "- **Recursive chunking** breaks down the text into smaller parts step by step using a given list of separators sorted from the most important to the least important separator. If the first split doesn't give the right size or shape of chunks, the method repeats itself on the new chunks using a different separator. For instance with the list of separators `[\"\\n\\n\", \"\\n\", \".\", \"\"]`:\n",
+    "    - The method will first break down the document wherever there is a double line break `\"\\n\\n\"`.\n",
+    "    - Resulting documents will be split again on simple line breaks `\"\\n\"`, then on sentence ends `\".\"`.\n",
+    "    - Finally, if some chunks are still too big, they will be split whenever they overflow the maximum size.\n",
+    "\n",
+    "- With this method, the global structure is well preserved, at the expense of getting slight variations in chunk size.\n",
+    "\n",
+    "> [This space](https://huggingface.co/spaces/A-Roucher/chunk_visualizer) lets you visualize how different splitting options affect the chunks you get.\n",
+    "\n",
+    "🔬 Let's experiment a bit with chunk sizes, beginning with an arbitrary size, and see how splits work. We use Langchain's implementation of recursive chunking with `RecursiveCharacterTextSplitter`.\n",
+    "- Parameter `chunk_size` controls the length of individual chunks: this length is counted by default as the number of characters in the chunk.\n",
+    "- Parameter `chunk_overlap` lets adjacent chunks get a bit of overlap on each other. This reduces the probability that an idea could be cut in half by the split between two adjacent chunks. We ~arbitrarily set this to 1/10th of the chunk size, you could try different values!"
+   ]
+ 
+   "source": [
+    "from langchain.text_splitter import RecursiveCharacterTextSplitter\n",
+    "\n",
+    "# We use a hierarchical list of separators specifically tailored for splitting Markdown documents\n",
+    "# This list is taken from LangChain's MarkdownTextSplitter class\n",
+    "MARKDOWN_SEPARATORS = [\n",
+    "    \"\\n#{1,6} \",\n",
+    "    \"```\\n\",\n",
+    "    \"\\n\\\\*\\\\*\\\\*+\\n\",\n",
+    "    \"\\n---+\\n\",\n",
+    "    \"\\n___+\\n\",\n",
+    "    \"\\n\\n\",\n",
+    "    \"\\n\",\n",
+    "    \" \",\n",
+    "    \"\",\n",
+    "]\n",
+    "\n",
+    "text_splitter = RecursiveCharacterTextSplitter(\n",
+    "    chunk_size=1000,  # The maximum number of characters in a chunk: we selected this value arbitrarily\n",
+    "    chunk_overlap=100,  # The number of characters to overlap between chunks\n",
+    "    add_start_index=True,  # If `True`, includes chunk's start index in metadata\n",
+    "    strip_whitespace=True,  # If `True`, strips whitespace from the start and end of every document\n",
+    "    separators=MARKDOWN_SEPARATORS,\n",
+    ")\n",
+    "\n",
+    "docs_processed = []\n",
+    "for doc in RAW_KNOWLEDGE_BASE:\n",
+    "    docs_processed += text_splitter.split_documents([doc])"
+   ]
+
+   "source": [
+    "We also have to keep in mind that when embedding documents, we will use an embedding model that accepts a certain maximum sequence length `max_seq_length`.\n",
+    "\n",
+    "So we should make sure that our chunk sizes are below this limit because any longer chunk will be truncated before processing, thus losing relevancy."
+   ]
+ 
+   "source": [
+    "from langchain.text_splitter import RecursiveCharacterTextSplitter\n",
+    "from transformers import AutoTokenizer\n",
+    "\n",
+    "EMBEDDING_MODEL_NAME = \"thenlper/gte-small\"\n",
+    "\n",
+    "\n",
+    "def split_documents(\n",
+    "    chunk_size: int,\n",
+    "    knowledge_base: List[LangchainDocument],\n",
+    "    tokenizer_name: Optional[str] = EMBEDDING_MODEL_NAME,\n",
+    ") -> List[LangchainDocument]:\n",
+    "    \"\"\"\n",
+    "    Split documents into chunks of maximum size `chunk_size` tokens and return a list of documents.\n",
+    "    \"\"\"\n",
+    "    text_splitter = RecursiveCharacterTextSplitter.from_huggingface_tokenizer(\n",
+    "        AutoTokenizer.from_pretrained(tokenizer_name),\n",
+    "        chunk_size=chunk_size,\n",
+    "        chunk_overlap=int(chunk_size / 10),\n",
+    "        add_start_index=True,\n",
+    "        strip_whitespace=True,\n",
+    "        separators=MARKDOWN_SEPARATORS,\n",
+    "    )\n",
+    "\n",
+    "    docs_processed = []\n",
+    "    for doc in knowledge_base:\n",
+    "        docs_processed += text_splitter.split_documents([doc])\n",
+    "\n",
+    "    # Remove duplicates\n",
+    "    unique_texts = {}\n",
+    "    docs_processed_unique = []\n",
+    "    for doc in docs_processed:\n",
+    "        if doc.page_content not in unique_texts:\n",
+    "            unique_texts[doc.page_content] = True\n",
+    "            docs_processed_unique.append(doc)\n",
+    "\n",
+    "    return docs_processed_unique\n",
+    "\n",
+    "\n",
+    "docs_processed = split_documents(\n",
+    "    512,  # We choose a chunk size adapted to our model\n",
+    "    RAW_KNOWLEDGE_BASE,\n",
+    "    tokenizer_name=EMBEDDING_MODEL_NAME,\n",
+    ")\n",
+    "\n",
+    "# Let's visualize the chunk sizes we would have in tokens from a common model\n",
+    "from transformers import AutoTokenizer\n",
+    "\n",
+    "tokenizer = AutoTokenizer.from_pretrained(EMBEDDING_MODEL_NAME)\n",
+    "lengths = [len(tokenizer.encode(doc.page_content)) for doc in tqdm(docs_processed)]\n",
+    "fig = pd.Series(lengths).hist()\n",
+    "plt.title(\"Distribution of document lengths in the knowledge base (in count of tokens)\")\n",
+    "plt.show()"
+   ]
+ 
+   "source": [
+    "➡️ Now the chunk length distribution looks better!"
+   ]
+  
+   "source": [
+    "### 1.2 Building the vector database\n",
+    "\n",
+    "We want to compute the embeddings for all the chunks of our knowledge base: to learn more about sentence embeddings, we recommend reading [this guide](https://osanseviero.github.io/hackerllama/blog/posts/sentence_embeddings/).\n",
+    "\n",
+    "#### How does retrieval work?\n",
+    "\n",
+    "Once the chunks are all embedded, we store them in a vector database. When the user types in a query, it gets embedded by the same model previously used, and a similarity search returns the closest documents from the vector database.\n",
+    "\n",
+    "The technical challenge is thus, given a query vector, to quickly find the nearest neighbors of this vector in the vector database. To do this, we need to choose two things: a distance, and a search algorithm to find the nearest neighbors quickly within a database of thousands of records.\n",
+    "\n",
+    "##### Nearest Neighbor search algorithm\n",
+    "\n",
+    "There are plentiful choices for the nearest neighbor search algorithm: we go with Facebook's [FAISS](https://github.com/facebookresearch/faiss) since FAISS is performant enough for most use cases, and it is well known and thus widely implemented.\n",
+    "\n",
+    "##### Distances\n",
+    "\n",
+    "Regarding distances, you can find a good guide [here](https://osanseviero.github.io/hackerllama/blog/posts/sentence_embeddings/#distance-between-embeddings). In short:\n",
+    "\n",
+    "- **Cosine similarity** computes the similarity between two vectors as the cosinus of their relative angle: it allows us to compare vector directions regardless of their magnitude. Using it requires normalizing all vectors, to rescale them into unit norm.\n",
+    "- **Dot product** takes into account magnitude, with the sometimes undesirable effect that increasing a vector's length will make it more similar to all others.\n",
+    "- **Euclidean distance** is the distance between the ends of vectors.\n",
+    "\n",
+    "You can try [this small exercise](https://developers.google.com/machine-learning/clustering/similarity/check-your-understanding) to check your understanding of these concepts. But once vectors are normalized, [the choice of a specific distance does not matter much](https://platform.openai.com/docs/guides/embeddings/which-distance-function-should-i-use).\n",
+    "\n",
+    "Our particular model works well with cosine similarity, so choose this distance, and we set it up both in the Embedding model, and in the `distance_strategy` argument of our FAISS index. With cosine similarity, we have to normalize our embeddings.\n",
+    "\n",
+    "🚨👇 The cell below takes a few minutes to run on A10G!"
+   ]
+  
+   "source": [
+    "from langchain.vectorstores import FAISS\n",
+    "from langchain_community.embeddings import HuggingFaceEmbeddings\n",
+    "from langchain_community.vectorstores.utils import DistanceStrategy\n",
+    "\n",
+    "embedding_model = HuggingFaceEmbeddings(\n",
+    "    model_name=EMBEDDING_MODEL_NAME,\n",
+    "    multi_process=True,\n",
+    "    model_kwargs={\"device\": \"cuda\"},\n",
+    "    encode_kwargs={\"normalize_embeddings\": True},  # Set `True` for cosine similarity\n",
+    ")\n",
+    "\n",
+    "KNOWLEDGE_VECTOR_DATABASE = FAISS.from_documents(\n",
+    "    docs_processed, embedding_model, distance_strategy=DistanceStrategy.COSINE\n",
+    ")"
+   ]  
+   "source": [
+    "👀 To visualize the search for the closest documents, let's project our embeddings from 384 dimensions down to 2 dimensions using PaCMAP.\n",
+    "\n",
+    "💡 _We chose PaCMAP rather than other techniques such as t-SNE or UMAP, since [it is efficient (preserves local and global structure), robust to initialization parameters and fast](https://www.nature.com/articles/s42003-022-03628-x#Abs1)._"
+   ]
+   "source": [
+    "# Embed a user query in the same space\n",
+    "user_query = \"How to create a pipeline object?\"\n",
+    "query_vector = embedding_model.embed_query(user_query)"
+   ] 
+   "source": [
+    "import pacmap\n",
+    "import numpy as np\n",
+    "import plotly.express as px\n",
+    "\n",
+    "embedding_projector = pacmap.PaCMAP(\n",
+    "    n_components=2, n_neighbors=None, MN_ratio=0.5, FP_ratio=2.0, random_state=1\n",
+    ")\n",
+    "\n",
+    "embeddings_2d = [\n",
+    "    list(KNOWLEDGE_VECTOR_DATABASE.index.reconstruct_n(idx, 1)[0])\n",
+    "    for idx in range(len(docs_processed))\n",
+    "] + [query_vector]\n",
+    "\n",
+    "# Fit the data (the index of transformed data corresponds to the index of the original data)\n",
+    "documents_projected = embedding_projector.fit_transform(\n",
+    "    np.array(embeddings_2d), init=\"pca\"\n",
+    ")"
+   ]  
+   "source": [
+    "df = pd.DataFrame.from_dict(\n",
+    "    [\n",
+    "        {\n",
+    "            \"x\": documents_projected[i, 0],\n",
+    "            \"y\": documents_projected[i, 1],\n",
+    "            \"source\": docs_processed[i].metadata[\"source\"].split(\"/\")[1],\n",
+    "            \"extract\": docs_processed[i].page_content[:100] + \"...\",\n",
+    "            \"symbol\": \"circle\",\n",
+    "            \"size_col\": 4,\n",
+    "        }\n",
+    "        for i in range(len(docs_processed))\n",
+    "    ]\n",
+    "    + [\n",
+    "        {\n",
+    "            \"x\": documents_projected[-1, 0],\n",
+    "            \"y\": documents_projected[-1, 1],\n",
+    "            \"source\": \"User query\",\n",
+    "            \"extract\": user_query,\n",
+    "            \"size_col\": 100,\n",
+    "            \"symbol\": \"star\",\n",
+    "        }\n",
+    "    ]\n",
+    ")\n",
+    "\n",
+    "# Visualize the embedding\n",
+    "fig = px.scatter(\n",
+    "    df,\n",
+    "    x=\"x\",\n",
+    "    y=\"y\",\n",
+    "    color=\"source\",\n",
+    "    hover_data=\"extract\",\n",
+    "    size=\"size_col\",\n",
+    "    symbol=\"symbol\",\n",
+    "    color_discrete_map={\"User query\": \"black\"},\n",
+    "    width=1000,\n",
+    "    height=700,\n",
+    ")\n",
+    "fig.update_traces(\n",
+    "    marker=dict(opacity=1, line=dict(width=0, color=\"DarkSlateGrey\")),\n",
+    "    selector=dict(mode=\"markers\"),\n",
+    ")\n",
+    "fig.update_layout(\n",
+    "    legend_title_text=\"<b>Chunk source</b>\",\n",
+    "    title=\"<b>2D Projection of Chunk Embeddings via PaCMAP</b>\",\n",
+    ")\n",
+    "fig.show()"
+   ] 
+   "source": [
+    "print(f\"\\nStarting retrieval for {user_query=}...\")\n",
+    "retrieved_docs = KNOWLEDGE_VECTOR_DATABASE.similarity_search(query=user_query, k=5)\n",
+    "print(\n",
+    "    \"\\n==================================Top document==================================\"\n",
+    ")\n",
+    "print(retrieved_docs[0].page_content)\n",
+    "print(\"==================================Metadata==================================\")\n",
+    "print(retrieved_docs[0].metadata)"
+   ]
+ 
+   "source": [
+    "# 2. Reader - LLM 💬\n",
+    "\n",
+    "In this part, the __LLM Reader reads the retrieved context to formulate its answer.__\n",
+    "\n",
+    "There are substeps that can all be tuned:\n",
+    "1. The content of the retrieved documents is aggregated together into the \"context\", with many processing options like _prompt compression_.\n",
+    "2. The context and the user query are aggregated into a prompt and then given to the LLM to generate its answer."
+   ]
+ 
+   "source": [
+    "### 2.1. Reader model\n",
+    "\n",
+    "The choice of a reader model is important in a few aspects:\n",
+    "- the reader model's `max_seq_length` must accommodate our prompt, which includes the context output by the retriever call: the context consists of 5 documents of 512 tokens each, so we aim for a context length of 4k tokens at least.\n",
+    "- the reader model\n",
+    "\n",
+    "For this example, we chose [`HuggingFaceH4/zephyr-7b-beta`](https://huggingface.co/HuggingFaceH4/zephyr-7b-beta), a small but powerful model.\n",
+    "\n",
+    "With many models being released every week, you may want to substitute this model to the latest and greatest. The best way to keep track of open source LLMs is to check the [Open-source LLM leaderboard](https://huggingface.co/spaces/HuggingFaceH4/open_llm_leaderboard).\n",
+    "\n",
+    "To make inference faster, we will load the quantized version of the model:"
+   ]
+ 
+   "source": [
+    "from transformers import pipeline\n",
+    "import torch\n",
+    "from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig\n",
+    "\n",
+    "READER_MODEL_NAME = \"HuggingFaceH4/zephyr-7b-beta\"\n",
+    "\n",
+    "bnb_config = BitsAndBytesConfig(\n",
+    "    load_in_4bit=True,\n",
+    "    bnb_4bit_use_double_quant=True,\n",
+    "    bnb_4bit_quant_type=\"nf4\",\n",
+    "    bnb_4bit_compute_dtype=torch.bfloat16,\n",
+    ")\n",
+    "model = AutoModelForCausalLM.from_pretrained(\n",
+    "    READER_MODEL_NAME, quantization_config=bnb_config\n",
+    ")\n",
+    "tokenizer = AutoTokenizer.from_pretrained(READER_MODEL_NAME)\n",
+    "\n",
+    "READER_LLM = pipeline(\n",
+    "    model=model,\n",
+    "    tokenizer=tokenizer,\n",
+    "    task=\"text-generation\",\n",
+    "    do_sample=True,\n",
+    "    temperature=0.2,\n",
+    "    repetition_penalty=1.1,\n",
+    "    return_full_text=False,\n",
+    "    max_new_tokens=500,\n",
+    ")"
+   ]
+ 
+   "source": [
+    "### 2.2. Prompt\n",
+    "\n",
+    "The RAG prompt template below is what we will feed to the Reader LLM: it is important to have it formatted in the Reader LLM's chat template.\n",
+    "\n",
+    "We give it our context and the user's question."
+   ]
+  
+
+   "source": [
+    "prompt_in_chat_format = [\n",
+    "    {\n",
+    "        \"role\": \"system\",\n",
+    "        \"content\": \"\"\"Using the information contained in the context,\n",
+    "give a comprehensive answer to the question.\n",
+    "Respond only to the question asked, response should be concise and relevant to the question.\n",
+    "Provide the number of the source document when relevant.\n",
+    "If the answer cannot be deduced from the context, do not give an answer.\"\"\",\n",
+    "    },\n",
+    "    {\n",
+    "        \"role\": \"user\",\n",
+    "        \"content\": \"\"\"Context:\n",
+    "{context}\n",
+    "---\n",
+    "Now here is the question you need to answer.\n",
+    "\n",
+    "Question: {question}\"\"\",\n",
+    "    },\n",
+    "]\n",
+    "RAG_PROMPT_TEMPLATE = tokenizer.apply_chat_template(\n",
+    "    prompt_in_chat_format, tokenize=False, add_generation_prompt=True\n",
+    ")\n",
+    "print(RAG_PROMPT_TEMPLATE)"   ]
+    "source": [
+    "retrieved_docs_text = [\n",
+    "    doc.page_content for doc in retrieved_docs\n",
+    "]  # We only need the text of the documents\n",
+    "context = \"\\nExtracted documents:\\n\"\n",
+    "context += \"\".join(\n",
+    "    [f\"Document {str(i)}:::\\n\" + doc for i, doc in enumerate(retrieved_docs_text)]\n",
+    ")\n",
+    "\n",
+    "final_prompt = RAG_PROMPT_TEMPLATE.format(\n",
+    "    question=\"How to create a pipeline object?\", context=context\n",
+    ")\n",
+    "\n",
+    "# Redact an answer\n",
+    "answer = READER_LLM(final_prompt)[0][\"generated_text\"]\n",
+    "print(answer)"
+   ]  
+   "source": [
+    "### 2.3. Reranking\n",
+    "\n",
+    "A good option for RAG is to retrieve more documents than you want in the end, then rerank the results with a more powerful retrieval model before keeping only the `top_k`.\n",
+    "\n",
+    "For this, [Colbertv2](https://arxiv.org/abs/2112.01488) is a great choice: instead of a bi-encoder like our classical embedding models, it is a cross-encoder that computes more fine-grained interactions between the query tokens and each document's tokens.\n",
+    "\n",
+    "It is easily usable thanks to [the RAGatouille library](https://github.com/bclavie/RAGatouille)."
+   ] 
+   "source": [
+    "from ragatouille import RAGPretrainedModel\n",
+    "\n",
+    "RERANKER = RAGPretrainedModel.from_pretrained(\"colbert-ir/colbertv2.0\")"
+   ]
+    "source": [
+    "# 3. Assembling it all!"
+   ] 
+   "source": [
+    "from transformers import Pipeline\n",
+    "\n",
+    "\n",
+    "def answer_with_rag(\n",
+    "    question: str,\n",
+    "    llm: Pipeline,\n",
+    "    knowledge_index: FAISS,\n",
+    "    reranker: Optional[RAGPretrainedModel] = None,\n",
+    "    num_retrieved_docs: int = 30,\n",
+    "    num_docs_final: int = 5,\n",
+    ") -> Tuple[str, List[LangchainDocument]]:\n",
+    "    # Gather documents with retriever\n",
+    "    print(\"=> Retrieving documents...\")\n",
+    "    relevant_docs = knowledge_index.similarity_search(\n",
+    "        query=question, k=num_retrieved_docs\n",
+    "    )\n",
+    "    relevant_docs = [doc.page_content for doc in relevant_docs]  # Keep only the text\n",
+    "\n",
+    "    # Optionally rerank results\n",
+    "    if reranker:\n",
+    "        print(\"=> Reranking documents...\")\n",
+    "        relevant_docs = reranker.rerank(question, relevant_docs, k=num_docs_final)\n",
+    "        relevant_docs = [doc[\"content\"] for doc in relevant_docs]\n",
+    "\n",
+    "    relevant_docs = relevant_docs[:num_docs_final]\n",
+    "\n",
+    "    # Build the final prompt\n",
+    "    context = \"\\nExtracted documents:\\n\"\n",
+    "    context += \"\".join(\n",
+    "        [f\"Document {str(i)}:::\\n\" + doc for i, doc in enumerate(relevant_docs)]\n",
+    "    )\n",
+    "\n",
+    "    final_prompt = RAG_PROMPT_TEMPLATE.format(question=question, context=context)\n",
+    "\n",
+    "    # Redact an answer\n",
+    "    print(\"=> Generating answer...\")\n",
+    "    answer = llm(final_prompt)[0][\"generated_text\"]\n",
+    "\n",
+    "    return answer, relevant_docs"
+   ]  
+   "source": [
+    "Let's see how our RAG pipeline answers a user query."] 
+   "source": [
+    "question = \"how to create a pipeline object?\"\n",
+    "\n",
+    "answer, relevant_docs = answer_with_rag(\n",
+    "    question, READER_LLM, KNOWLEDGE_VECTOR_DATABASE, reranker=RERANKER\n",
+    ")"
+   ]   
+   "source": [
+    "print(\"==================================Answer==================================\")\n",
+    "print(f\"{answer}\")\n",
+    "print(\"==================================Source docs==================================\")\n",
+    "for i, doc in enumerate(relevant_docs):\n",
+    "    print(f\"Document {i}------------------------------------------------------------\")\n",
+    "    print(doc)"
+   ] 
+   "source": [
+    "✅ We now have a fully functional, performant RAG system. That's it for today! Congratulations for making it to the end 🥳\n",
+    "\n",
+    "\n",
+    "# To go further 🗺️\n",
+    "\n",
+    "This is not the end of the journey! You can try many steps to improve your RAG system. We recommend doing so in an iterative way: bring small changes to the system and see what improves performance.\n",
+    "\n",
+    "### Setting up an evaluation pipeline\n",
+    "\n",
+    "- 💬 \"You cannot improve the model performance that you do not measure\", said Gandhi... or at least Llama2 told me he said it. Anyway, you should absolutely start by measuring performance: this means building a small evaluation dataset, and then monitor the performance of your RAG system on this evaluation dataset.\n",
+    "\n",
+    "### Improving the retriever\n",
+    "\n",
+    "🛠️ __You can use these options to tune the results:__\n",
+    "\n",
+    "- Tune the chunking method:\n",
+    "    - Size of the chunks\n",
+    "    - Method: split on different separators, use [semantic chunking](https://python.langchain.com/docs/modules/data_connection/document_transformers/semantic-chunker)...\n",
+    "- Change the embedding model\n",
+    "\n",
+    "👷‍♀️ __More could be considered:__\n",
+    "- Try another chunking method, like semantic chunking\n",
+    "- Change the index used (here, FAISS)\n",
+    "- Query expansion: reformulate the user query in slightly different ways to retrieve more documents.\n",
+    "\n",
+    "### Improving the reader\n",
+    "\n",
+    "🛠️ __Here you can try the following options to improve results:__\n",
+    "- Tune the prompt\n",
+    "- Switch reranking on/off\n",
+    "- Choose a more powerful reader model\n",
+    "\n",
+    "💡 __Many options could be considered here to further improve the results:__\n",
+    "- Compress the retrieved context to keep only the most relevant parts to answer the query.\n",
+    "- Extend the RAG system to make it more user-friendly:\n",
+    "    - cite source\n",
+    "    - make conversational"
+   ]
