@@ -1,8 +1,5 @@
 from fastapi import FastAPI, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi_limiter import FastAPILimiter
-from fastapi_limiter.depends import RateLimiter
-import redis.asyncio as redis
 from typing import Optional
 import json
 
@@ -19,13 +16,8 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Initialize Redis connection for rate limiting
 @app.on_event("startup")
 async def startup():
-    # Initialize dependencies
-    redis_connection = redis.from_url("redis://localhost:6379", encoding="utf-8")
-    await FastAPILimiter.init(redis_connection)
-    
     # Initialize vector retriever with async loading
     global retriever
     retriever = VectorRetriever()
@@ -48,7 +40,6 @@ async def retrieve_async(
     query: str,
     top_k: int = 5,
     rerank: bool = True,
-    rate_limiter: RateLimiter = Depends(RateLimiter(times=10, minutes=1))
 ):
     """Retrieve documents with rate limiting"""
     try:
