@@ -1,16 +1,17 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
-from slowapi import Limiter
-from slowapi.util import get_remote_address
+from fastapi_limiter import FastAPILimiter
+from fastapi_limiter.depends import RateLimiter
+import redis.asyncio as redis
 from typing import Optional
-import uvicorn
-from pydantic import BaseModel
-from coderag.search import answer_with_rag
-from coderag.monitor import track_performance
+import json
 
-app = FastAPI(title="CodeRAG API")
+from coderag.core.vector_retriever import VectorRetriever
+from coderag.monitor import monitor
 
-# CORS configuration
+app = FastAPI()
+
+# Configure CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -18,33 +19,45 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Rate limiting
-limiter = Limiter(key_func=get_remote_address)
-app.state.limiter = limiter
+# Initialize Redis connection for rate limiting
+@app.on_event("startup")
+async def startup():
+    # Initialize dependencies
+    redis_connection = redis.from_url("redis://localhost:6379", encoding="utf-8")
+    await FastAPILimiter.init(redis_connection)
+    
+    # Initialize vector retriever with async loading
+    global retriever
+    retriever = VectorRetriever()
+    await retriever.load_documents([])  # Initialize empty index
 
-class QueryRequest(BaseModel):
-    question: str
-    top_k: Optional[int] = 5
-
-@app.post("/query")
-@limiter.limit("10/minute")
-async def rag_query(request: QueryRequest):
-    """Main RAG endpoint with rate limiting"""
+@app.post("/process-docs")
+@monitor.track("process_documents")
+async def process_documents_async(document: str, incremental: bool = False):
+    """Process documents with async batch processing"""
     try:
-        answer, docs = answer_with_rag(
-            question=request.question,
-            top_k=request.top_k
-        )
-        return {
-            "answer": answer,
-            "sources": [doc.metadata["source"] for doc in docs]
-        }
+        docs = [{"page_content": document, "metadata": {}}]  # Simplified doc format
+        await retriever.load_documents(docs, incremental)
+        return {"status": "processed"}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.get("/health")
-def health_check():
-    return {"status": "ok"}
+@app.get("/retrieve")
+@monitor.track("retrieve")
+async def retrieve_async(
+    query: str,
+    top_k: int = 5,
+    rerank: bool = True,
+    rate_limiter: RateLimiter = Depends(RateLimiter(times=10, minutes=1))
+):
+    """Retrieve documents with rate limiting"""
+    try:
+        results = retriever.retrieve(query, top_k, rerank)
+        return {"results": [{"content": r.page_content, "metadata": r.metadata} for r in results]}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
-if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+@app.get("/metrics")
+async def get_metrics():
+    """Get performance metrics"""
+    return monitor.get_metrics()

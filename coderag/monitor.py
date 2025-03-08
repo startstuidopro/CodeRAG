@@ -1,83 +1,59 @@
+from functools import wraps
+from datetime import datetime
 import time
 import json
-from datetime import datetime
-from typing import Dict, Any, List
-import pandas as pd
-from prometheus_client import start_http_server, Summary, Counter, Gauge
+from typing import Callable, Any
+from collections import defaultdict
 
-# Prometheus metrics
-REQUEST_LATENCY = Summary('rag_request_latency_seconds', 'RAG request processing latency')
-REQUEST_COUNT = Counter('rag_request_count', 'Total RAG requests')
-ERROR_COUNT = Counter('rag_error_count', 'Total RAG errors')
-CACHE_HIT_RATE = Gauge('rag_cache_hit_rate', 'Cache hit rate percentage')
-
-class QueryAnalytics:
+class PerformanceMonitor:
     def __init__(self):
-        self.queries = []
         self.metrics = {
-            'latency': [],
-            'cache_hits': 0,
-            'total_requests': 0
+            'latency': defaultdict(list),
+            'throughput': defaultdict(int),
+            'error_rates': defaultdict(int),
+            'accuracy': defaultdict(list)
         }
     
-    def track_query(self, query: str, sources: List[str], latency: float):
-        self.queries.append({
-            "timestamp": datetime.utcnow().isoformat(),
-            "query": query,
-            "sources": sources,
-            "latency": latency
-        })
-        self.metrics['total_requests'] += 1
-        self.metrics['latency'].append(latency)
-        
-    def track_cache_hit(self):
-        self.metrics['cache_hits'] += 1
-        CACHE_HIT_RATE.set(self.cache_hit_percentage)
+    def track(self, operation_name: str):
+        def decorator(func: Callable) -> Callable:
+            @wraps(func)
+            def wrapper(*args, **kwargs) -> Any:
+                start_time = time.perf_counter()
+                try:
+                    result = func(*args, **kwargs)
+                    latency = time.perf_counter() - start_time
+                    
+                    # Record latency
+                    self.metrics['latency'][operation_name].append(latency)
+                    
+                    # Record throughput
+                    self.metrics['throughput'][operation_name] += 1
+                    
+                    # If processing documents, record accuracy metrics
+                    if operation_name == 'retrieve':
+                        expected = kwargs.get('expected_result')
+                        if expected and result:
+                            accuracy = self.calculate_accuracy(result, expected)
+                            self.metrics['accuracy'][operation_name].append(accuracy)
+                    
+                    return result
+                except Exception as e:
+                    self.metrics['error_rates'][operation_name] += 1
+                    raise
+            return wrapper
+        return decorator
     
-    @property
-    def cache_hit_percentage(self) -> float:
-        if self.metrics['total_requests'] == 0:
-            return 0.0
-        return (self.metrics['cache_hits'] / self.metrics['total_requests']) * 100
+    def calculate_accuracy(self, actual, expected):
+        # Simple content overlap accuracy metric
+        actual_content = actual.page_content if hasattr(actual, 'page_content') else str(actual)
+        expected_content = expected.page_content if hasattr(expected, 'page_content') else str(expected)
+        common_tokens = set(actual_content.split()) & set(expected_content.split())
+        return len(common_tokens) / max(len(expected_content.split()), 1)
     
-    def get_latency_stats(self) -> Dict[str, float]:
-        series = pd.Series(self.metrics['latency'])
+    def get_metrics(self):
         return {
-            "mean": series.mean(),
-            "p95": series.quantile(0.95),
-            "max": series.max()
+            'timestamp': datetime.now().isoformat(),
+            **self.metrics
         }
 
-def start_monitoring(port=9100):
-    """Start metrics server and background monitoring"""
-    start_http_server(port)
-    print(f"Monitoring server started on port {port}")
-
-# Global analytics instance
-analytics = QueryAnalytics()
-
-def track_performance(func):
-    """Decorator to track RAG method performance"""
-    def wrapper(*args, **kwargs):
-        start_time = time.time()
-        try:
-            result = func(*args, **kwargs)
-            latency = time.time() - start_time
-            
-            # Track metrics
-            REQUEST_LATENCY.observe(latency)
-            REQUEST_COUNT.inc()
-            
-            if 'question' in kwargs and 'docs' in result:
-                analytics.track_query(
-                    query=kwargs['question'],
-                    sources=[doc.metadata.get('source', '') for doc in result['docs']],
-                    latency=latency
-                )
-            
-            return result
-        except Exception as e:
-            ERROR_COUNT.inc()
-            raise
-    
-    return wrapper
+monitor = PerformanceMonitor()

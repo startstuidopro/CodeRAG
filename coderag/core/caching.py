@@ -1,13 +1,13 @@
-import redis
-import json
-from typing import Optional, Any
+from typing import Dict, Any, Optional
 import hashlib
+import json
 import numpy as np
+from datetime import datetime
 
 class CacheManager:
-    def __init__(self, host: str = "localhost", port: int = 6379, ttl: int = 3600):
-        self.redis = redis.Redis(host=host, port=port, decode_responses=True)
-        self.ttl = ttl  # Time-to-live in seconds
+    def __init__(self):
+        self.cache: Dict[str, Any] = {}
+        self.ttl: Dict[str, datetime] = {}
 
     def _generate_key(self, prefix: str, content: Any) -> str:
         """Create unique cache key using SHA-256 hash"""
@@ -15,35 +15,23 @@ class CacheManager:
         return f"{prefix}:{hashlib.sha256(content_str.encode()).hexdigest()}"
 
     def cache_embeddings(self, document_hash: str, embeddings: np.ndarray):
-        """Store embeddings with document hash as key"""
+        """Store embeddings in memory"""
         key = self._generate_key("emb", document_hash)
-        self.redis.set(key, json.dumps(embeddings.tolist()), ex=self.ttl)
+        self.cache[key] = embeddings.tolist()
+        self.ttl[key] = datetime.now()
 
     def get_cached_embeddings(self, document_hash: str) -> Optional[np.ndarray]:
         """Retrieve cached embeddings"""
         key = self._generate_key("emb", document_hash)
-        cached = self.redis.get(key)
-        return np.array(json.loads(cached)) if cached else None
+        return np.array(self.cache.get(key)) if key in self.cache else None
 
-    def cache_llm_response(self, query: str, context: str, response: str):
-        """Cache LLM responses using query+context as key"""
-        composite_key = {"query": query, "context": context}
-        key = self._generate_key("llm", composite_key)
-        self.redis.set(key, response, ex=self.ttl)
-
-    def get_cached_response(self, query: str, context: str) -> Optional[str]:
-        """Get cached LLM response"""
-        composite_key = {"query": query, "context": context}
-        key = self._generate_key("llm", composite_key)
-        return self.redis.get(key)
-
-    def cache_query_results(self, query: str, results: list, top_k: int = 5):
-        """Cache retrieved documents for queries"""
+    def cache_query_results(self, query: str, results: list):
+        """Cache query results in memory"""
         key = self._generate_key("query", query)
-        self.redis.set(key, json.dumps(results[:top_k]), ex=self.ttl)
+        self.cache[key] = results
+        self.ttl[key] = datetime.now()
 
     def get_cached_query_results(self, query: str) -> Optional[list]:
-        """Retrieve cached query results"""
+        """Get cached query results"""
         key = self._generate_key("query", query)
-        cached = self.redis.get(key)
-        return json.loads(cached) if cached else None
+        return self.cache.get(key)
